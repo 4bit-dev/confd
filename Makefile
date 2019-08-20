@@ -1,11 +1,11 @@
-.PHONY: build install clean test integration dep release
+.PHONY: build install clean test integration release
 VERSION=`egrep -o '[0-9]+\.[0-9a-z.\-]+' version.go`
 GIT_SHA=`git rev-parse --short HEAD || echo`
 
 build:
 	@echo "Building confd..."
 	@mkdir -p bin
-	@go build -ldflags "-X main.GitSHA=${GIT_SHA}" -o bin/confd .
+	@go build -mod=vendor -ldflags "-X main.GitSHA=${GIT_SHA}" -o bin/confd .
 
 install:
 	@echo "Installing confd..."
@@ -16,7 +16,7 @@ clean:
 
 test:
 	@echo "Running tests..."
-	@go test `go list ./... | grep -v vendor/`
+	@go test -mod=vendor `go list ./... | grep -v vendor/`
 
 integration:
 	@echo "Running integration tests..."
@@ -26,9 +26,6 @@ integration:
 		bash integration/expect/check.sh || exit 1; \
 		rm /tmp/confd-*; \
 	done
-
-dep:
-	@dep ensure
 
 release:
 	@docker build -q -t confd_builder -f Dockerfile.build.alpine .

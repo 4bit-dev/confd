@@ -1,0 +1,117 @@
+trigger:
+- master
+- develop
+
+pool:
+  vmImage: 'ubuntu-16.04'
+
+variables:
+  GOBIN:  '$(GOPATH)/bin' # Go binaries path
+  GOROOT: '/usr/local/go1.11' # Go installation path
+  GOPATH: '$(system.defaultWorkingDirectory)/gopath' # Go workspace path
+  GO111MODULE: on
+  modulePath: '$(GOPATH)/src/github.com/kelseyhightower/confd' # Path to the module's code
+
+  VAULT_ADDR: 'http://127.0.0.1:8200'
+  CONSUL_VERSION: '0.9.3'
+  ETCD_VERSION: '3.3.1'
+  DYNAMODB_VERSION: '2017-02-16'
+  VAULT_VERSION: '0.10.1'
+  ZOOKEEPER_VERSION: '3.4.14'
+  RANCHER_VERSION: '0.6.0'
+  REDIS_PORT: "$(agent.services.redis.ports.6379)"
+
+steps:
+- script: |
+    mkdir -p '$(GOBIN)'
+    mkdir -p '$(GOPATH)/pkg'
+    mkdir -p '$(modulePath)'
+    shopt -s extglob
+    mv !(gopath) '$(modulePath)'
+    echo '##vso[task.prependpath]$(GOBIN)'
+    echo '##vso[task.prependpath]$(GOROOT)/bin'
+  displayName: 'Set up the Go workspace'
+
+- script: |
+    if [ -f Gopkg.toml ]; then
+        curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+        dep ensure -v
+    fi
+  workingDirectory: '$(modulePath)'
+  displayName: 'Download dep and run `dep ensure`'
+
+- script: make test
+  displayName: Make test
+  workingDirectory: '$(modulePath)'
+
+- script: make build && sudo make install
+  displayName: Make build
+  workingDirectory: '$(modulePath)'
+
+- script: |
+    VERSION=`egrep -o '[0-9]+\.[0-9a-z.\-]+' version.go`
+    GIT_SHA=`git rev-parse --short HEAD || echo`
+    for platform in darwin linux windows; do
+      if [ $platform == windows ]; then extension=.exe; fi;
+      GOOS=$platform GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w -X main.GitSHA=${GIT_SHA}" -o bin/confd-${VERSION}-$platform-amd64$extension
+    done
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w -X main.GitSHA=${GIT_SHA}" -o bin/confd-${VERSION}-linux-arm64
+  displayName: Make release
+  workingDirectory: '$(modulePath)'
+
+- script: |
+    sudo apt-get update && sudo apt-get install -y redis-tools upx
+    # install consul
+    wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+    unzip consul_${CONSUL_VERSION}_linux_amd64.zip
+    sudo mv consul /bin/
+    consul agent -server -bootstrap-expect 1 -data-dir /tmp/consul -bind 127.0.0.1 &
+    # install etcd
+    wget https://github.com/coreos/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-amd64.tar.gz
+    tar xzf etcd-v${ETCD_VERSION}-linux-amd64.tar.gz
+    sudo mv etcd-v${ETCD_VERSION}-linux-amd64/etcd /bin/
+    sudo mv etcd-v${ETCD_VERSION}-linux-amd64/etcdctl /bin/
+    unset ETCD_VERSION
+    etcd &
+    # install DynamoDB
+    sudo pip install awscli
+    mkdir /tmp/dynamodb
+    wget -O - https://s3-us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_${DYNAMODB_VERSION}.tar.gz | tar xz --directory /tmp/dynamodb
+    java -Djava.library.path=/tmp/dynamodb/DynamoDBLocal_lib -jar /tmp/dynamodb/DynamoDBLocal.jar -inMemory &
+    # Install rancher metadata
+    wget https://github.com/rancher/rancher-metadata/releases/download/v${RANCHER_VERSION}/rancher-metadata.tar.gz
+    mkdir -p ./rancher-metadata
+    tar xzf rancher-metadata.tar.gz --strip-components=1 -C ./rancher-metadata
+    sudo mv ./rancher-metadata/bin/rancher-metadata /bin/
+    # Install vault
+    wget https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip
+    unzip vault_${VAULT_VERSION}_linux_amd64.zip
+    sudo mv vault /bin/
+    vault server -dev &
+    # Install zookeeper
+    wget http://archive.apache.org/dist/zookeeper/zookeeper-${ZOOKEEPER_VERSION}/zookeeper-${ZOOKEEPER_VERSION}.tar.gz
+    tar xzf zookeeper-${ZOOKEEPER_VERSION}.tar.gz
+    mkdir /tmp/zookeeper && cp integration/zookeeper/zoo.cfg zookeeper-${ZOOKEEPER_VERSION}/conf/zoo.cfg
+    zookeeper-${ZOOKEEPER_VERSION}/bin/zkServer.sh start
+    # Run AWS SSM mocking server
+    go run -mod=vendor ./integration/ssm/main.go &
+  workingDirectory: '$(modulePath)'
+  displayName: Initialize integration test
+
+- script: make integration
+  displayName: Make integration
+  workingDirectory: '$(modulePath)'
+
+- publish: '$(modulePath)/bin'
+  artifact: confd
+
+services:
+  redis: redis
+
+resources:
+  containers:
+  - container: redis
+    image: redis:5.0.4-alpine
+    network: host
+    ports:
+    - "6379"
